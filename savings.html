@@ -1,0 +1,389 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Savings</title>
+
+<h1>Savings</h1>
+
+<section>
+  <p>Columns: <b>Amount, Currency, Type, Country, Bank</b></p>
+  <button id="btnNew">New (clear)</button>
+  <button id="btnOpen">Open…</button>
+  <input id="fileOpenFallback" type="file" accept=".csv,text/csv" style="display:none">
+  <button id="btnSave">Save</button>
+  <button id="btnSaveAs">Save As…</button>
+  <span id="fileName"></span>
+</section>
+
+<hr>
+
+<section>
+  <h3>Add entry</h3>
+  <div>
+    <label>Amount <input id="fAmount" type="number" step="any" required></label>
+    <label>Currency
+      <select id="fCurrency">
+        <option>RUB</option>
+        <option>USD</option>
+        <option>EUR</option>
+        <option>GBP</option>
+        <option>UZS</option>
+      </select>
+    </label>
+    <label>Type
+      <select id="fType">
+        <option>Cash</option>
+        <option>Digital</option>
+      </select>
+    </label>
+    <label>Country <input id="fCountry" type="text" maxlength="32"></label>
+    <label>Bank <input id="fBank" type="text" maxlength="64"></label>
+    <button id="btnAdd">Add</button>
+  </div>
+</section>
+
+<hr>
+
+<section>
+  <h3>Rates & total</h3>
+  <div>
+    <label>Show in currency
+      <select id="outCur">
+        <option>RUB</option>
+        <option selected>USD</option>
+        <option>EUR</option>
+        <option>GBP</option>
+        <option>UZS</option>
+      </select>
+    </label>
+    <button id="btnRefresh">Refresh rates</button>
+    <span id="ratesInfo"></span>
+  </div>
+  <p><b>Total:</b> <span id="totalOut">—</span></p>
+  <p>Used currencies in data: <span id="usedCur">—</span></p>
+</section>
+
+<hr>
+
+<section>
+  <h3>Data</h3>
+  <table id="tbl" border="1" cellpadding="4">
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>Amount</th>
+        <th>Currency</th>
+        <th>Type</th>
+        <th>Country</th>
+        <th>Bank</th>
+        <th>Actions</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+</section>
+
+<script>
+(() => {
+  "use strict";
+
+  const HEADERS = ["Amount","Currency","Type","Country","Bank"];
+  const RU_HEADERS = ["Сумма","Валюта","Кеш/Цифра","Страна","Банк"]; // auto-map if detected
+  const SUPPORTED = ["RUB","USD","EUR","GBP","UZS"];
+  const RATES_API = "https://open.er-api.com/v6/latest/USD"; // base USD
+
+  let rows = [];
+  let fileHandle = null;
+  let fileName = "";
+  let rates = {}; // {"USD":1, "EUR":0.9, ...} from API (USD-based)
+
+  const $ = (sel) => document.querySelector(sel);
+  const $tbody = $("#tbl tbody");
+  const $fileName = $("#fileName");
+  const $usedCur = $("#usedCur");
+  const $totalOut = $("#totalOut");
+  const $ratesInfo = $("#ratesInfo");
+  const $outCur = $("#outCur");
+
+  function setName(name) {
+    fileName = name || "";
+    $fileName.textContent = fileName ? ("[" + fileName + "]") : "";
+  }
+
+  function parseNumber(v) {
+    if (typeof v === "number") return v;
+    if (!v) return 0;
+    const s = String(v).replace(/\s+/g,"").replace(",",".");
+    const n = parseFloat(s);
+    return Number.isFinite(n) ? n : 0;
+  }
+
+  function detectDelimiter(line) {
+    const c = (line.match(/,/g)||[]).length;
+    const s = (line.match(/;/g)||[]).length;
+    return s > c ? ";" : ",";
+  }
+
+  function parseCSV(text) {
+    text = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    const lines = text.split("\n").filter(l => l.length > 0);
+    if (!lines.length) return {headers:[], records:[]};
+    const delim = detectDelimiter(lines[0]);
+
+    function splitLine(line) {
+      const out = [];
+      let cur = "", q = false;
+      for (let i=0;i<line.length;i++) {
+        const ch = line[i];
+        if (ch === '"') {
+          if (q && line[i+1] === '"') { cur += '"'; i++; }
+          else { q = !q; }
+        } else if (ch === delim && !q) {
+          out.push(cur); cur = "";
+        } else {
+          cur += ch;
+        }
+      }
+      out.push(cur);
+      return out;
+    }
+
+    const rawHeaders = splitLine(lines[0]).map(h => h.trim().replace(/^\uFEFF/,""));
+    let headers = rawHeaders;
+    if (arrayEq(headers, RU_HEADERS)) headers = HEADERS.slice();
+    if (!arrayEq(headers, HEADERS)) {
+      throw new Error("Unexpected headers. Expected: " + HEADERS.join(", "));
+    }
+
+    const records = [];
+    for (let i=1;i<lines.length;i++) {
+      const cols = splitLine(lines[i]);
+      if (cols.every(c => c.trim() === "")) continue;
+      const obj = {};
+      headers.forEach((h, idx) => obj[h] = (cols[idx] ?? "").trim());
+      records.push(obj);
+    }
+    return {headers, records};
+  }
+
+  function arrayEq(a, b) {
+    if (a.length !== b.length) return false;
+    for (let i=0;i<a.length;i++) if (a[i] !== b[i]) return false;
+    return true;
+  }
+
+  function needQuote(s) { return /[",\n;]/.test(s); }
+  function toCSV(rowsArr) {
+    const delim = ",";
+    const esc = (v) => {
+      const s = String(v ?? "");
+      return needQuote(s) ? '"' + s.replace(/"/g,'""') + '"' : s;
+    };
+    const headerLine = HEADERS.map(esc).join(delim);
+    const lines = rowsArr.map(r => HEADERS.map(h => esc(r[h])).join(delim));
+    return [headerLine, ...lines].join("\r\n");
+  }
+
+  function renderTable() {
+    $tbody.innerHTML = "";
+    rows.forEach((r, idx) => {
+      const tr = document.createElement("tr");
+      tr.innerHTML =
+        "<td>"+(idx+1)+"</td>"+
+        "<td>"+(r.Amount ?? "")+"</td>"+
+        "<td>"+(r.Currency ?? "")+"</td>"+
+        "<td>"+(r.Type ?? "")+"</td>"+
+        "<td>"+(r.Country ?? "")+"</td>"+
+        "<td>"+(r.Bank ?? "")+"</td>"+
+        "<td><button data-del='"+idx+"'>Delete</button></td>";
+      $tbody.appendChild(tr);
+    });
+    renderUsedCurrencies();
+    computeTotal();
+  }
+
+  function renderUsedCurrencies() {
+    const set = new Set(rows.map(r => (r.Currency||"").trim().toUpperCase()).filter(Boolean));
+    const used = Array.from(set).sort();
+    $usedCur.textContent = used.length ? used.join(", ") : "—";
+  }
+
+  function getRate(code) {
+    code = (code||"").toUpperCase();
+    return rates[code]; // USD-based
+  }
+
+  // Convert amount in src -> dst using USD-based rates: amount * (rateDst / rateSrc)
+  function convert(amount, src, dst) {
+    const rS = getRate(src);
+    const rD = getRate(dst);
+    if (!rS || !rD) return NaN;
+    return amount * (rD / rS);
+  }
+
+  function computeTotal() {
+    const out = $outCur.value.toUpperCase();
+    let total = 0;
+    let missing = new Set();
+
+    for (const r of rows) {
+      const amt = parseNumber(r.Amount);
+      const cur = (r.Currency||"").toUpperCase();
+      if (!amt || !cur) continue;
+      const rS = getRate(cur);
+      const rD = getRate(out);
+      if (!rS || !rD) { missing.add(!rS ? cur : out); continue; }
+      total += convert(amt, cur, out);
+    }
+
+    $totalOut.textContent = Number.isFinite(total) ? (total.toFixed(2) + " " + out) : "—";
+    if (missing.size) {
+      $ratesInfo.textContent = "Missing rates: " + Array.from(missing).join(", ");
+    }
+  }
+
+  async function fetchRates() {
+    try {
+      $ratesInfo.textContent = "Loading rates…";
+      const res = await fetch(RATES_API, {cache:"no-store"});
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const json = await res.json();
+      if (!json || !json.rates) throw new Error("Bad payload");
+      const r = json.rates;
+      rates = {};
+      SUPPORTED.forEach(c => { if (r[c] != null) rates[c] = Number(r[c]); });
+      // ensure USD exists (base)
+      if (r["USD"] != null) rates["USD"] = Number(r["USD"]);
+      const when = json.time_last_update_utc || "";
+      const have = Object.keys(rates).sort().join(", ");
+      $ratesInfo.textContent = "Rates from open.er-api.com (base USD). Updated: " + when + ". Loaded: " + have;
+      computeTotal();
+    } catch (e) {
+      $ratesInfo.textContent = "Failed to load rates: " + (e && e.message ? e.message : e);
+    }
+  }
+
+  const supportsFS = !!window.showOpenFilePicker && !!window.showSaveFilePicker;
+
+  $("#btnNew").addEventListener("click", () => {
+    rows = [];
+    fileHandle = null;
+    setName("");
+    renderTable();
+  });
+
+  $("#btnAdd").addEventListener("click", () => {
+    const rec = {
+      Amount: $("#fAmount").value.trim(),
+      Currency: $("#fCurrency").value.trim().toUpperCase(),
+      Type: $("#fType").value.trim(),
+      Country: $("#fCountry").value.trim(),
+      Bank: $("#fBank").value.trim()
+    };
+    if (!rec.Amount || !rec.Currency) {
+      alert("Amount and Currency are required.");
+      return;
+    }
+    rows.push(rec);
+    renderTable();
+    $("#fCurrency").focus();
+  });
+
+  $tbody.addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-del]");
+    if (!btn) return;
+    const idx = parseInt(btn.getAttribute("data-del"), 10);
+    if (Number.isFinite(idx)) {
+      rows.splice(idx, 1);
+      renderTable();
+    }
+  });
+
+  $("#btnOpen").addEventListener("click", async () => {
+    if (supportsFS) {
+      try {
+        const [handle] = await window.showOpenFilePicker({
+          types: [{ description: "CSV", accept: {"text/csv": [".csv"]} }],
+          multiple: false
+        });
+        fileHandle = handle;
+        const file = await handle.getFile();
+        const text = await file.text();
+        const parsed = parseCSV(text);
+        rows = parsed.records;
+        setName(file.name);
+        renderTable();
+      } catch (err) {
+        if (err && err.name === "AbortError") return;
+        alert("Open failed: " + err.message);
+      }
+    } else {
+      $("#fileOpenFallback").click();
+    }
+  });
+
+  $("#fileOpenFallback").addEventListener("change", (e) => {
+    const f = e.target.files && e.target.files[0];
+    if (!f) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const parsed = parseCSV(reader.result);
+        rows = parsed.records;
+        setName(f.name);
+        renderTable();
+      } catch (err) {
+        alert("Open failed: " + err.message);
+      }
+    };
+    reader.readAsText(f, "UTF-8");
+  });
+
+  async function saveUsingFS(pickNew) {
+    try {
+      if (pickNew || !fileHandle) {
+        fileHandle = await window.showSaveFilePicker({
+          suggestedName: fileName || "savings.csv",
+          types: [{ description: "CSV", accept: {"text/csv": [".csv"]} }]
+        });
+        setName((await fileHandle.getFile()).name);
+      }
+      const writable = await fileHandle.createWritable();
+      await writable.write(new Blob([toCSV(rows)], {type: "text/csv"}));
+      await writable.close();
+      alert("Saved.");
+    } catch (err) {
+      if (err && err.name === "AbortError") return;
+      alert("Save failed: " + err.message);
+    }
+  }
+
+  function downloadFallback() {
+    const blob = new Blob([toCSV(rows)], {type: "text/csv"});
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = fileName || "savings.csv";
+    document.body.appendChild(a);
+    a.click();
+    URL.revokeObjectURL(a.href);
+    a.remove();
+  }
+
+  $("#btnSave").addEventListener("click", async () => {
+    if (supportsFS) await saveUsingFS(false);
+    else downloadFallback();
+  });
+
+  $("#btnSaveAs").addEventListener("click", async () => {
+    if (supportsFS) await saveUsingFS(true);
+    else downloadFallback();
+  });
+
+  $("#btnRefresh").addEventListener("click", fetchRates);
+  $outCur.addEventListener("change", computeTotal);
+
+  renderTable();
+  fetchRates();
+})();
+</script>
+</html>
